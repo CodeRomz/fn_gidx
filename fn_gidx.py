@@ -241,6 +241,64 @@ def delete_document(client: "genai.Client", document_name: str) -> None:
     delete_fn(document_name)
 
 
+
+def _get_document_by_name(client: "genai.Client", document_name: str) -> Optional[object]:
+    """Fetch a document by resource name; return None if missing or unsupported."""
+    documents = getattr(client.file_search_stores, "documents", None)
+    if documents is not None and hasattr(documents, "get"):
+        for kwargs in (
+            {"name": document_name},
+            {"document_name": document_name},
+        ):
+            try:
+                return documents.get(**kwargs)
+            except TypeError:
+                continue
+            except Exception:
+                return None
+
+    get_fn = getattr(client.file_search_stores, "get_document", None)
+    if get_fn is None:
+        return None
+
+    for kwargs in (
+        {"name": document_name},
+        {"document_name": document_name},
+    ):
+        try:
+            return get_fn(**kwargs)
+        except TypeError:
+            continue
+        except Exception:
+            return None
+
+    try:
+        return get_fn(document_name)
+    except Exception:
+        return None
+
+
+def _remote_document_exists(
+    client: "genai.Client",
+    store_name: str,
+    file_name: str,
+    remote_document_name: str,
+    *,
+    allow_fallback: bool,
+) -> bool:
+    """Check if a remote document exists by name or display name."""
+    if remote_document_name:
+        doc = _get_document_by_name(client, remote_document_name)
+        if doc is not None:
+            return True
+
+    if not allow_fallback:
+        return False
+
+    matches = find_document(client, store_name, file_name)
+    return bool(matches)
+
+
 def looks_like_pdf(path: Path, *, check_magic: bool) -> bool:
     """Verify PDF magic bytes."""
     if not check_magic:
@@ -437,7 +495,7 @@ def build_index_row(pdf_path: Path) -> Optional[FileRow]:
     )
 
 
-def export_qms_pdf(rows: List[FileRow], output_path: Path) -> Path:
+def export_gidx_pdf(rows: List[FileRow], output_path: Path) -> Path:
     """Generate a PDF table with file metadata."""
     try:
         from reportlab.lib import colors
@@ -839,9 +897,9 @@ def delete_remote_document(
 
 def build_output_paths(output_dir: Path) -> Tuple[Path, Path, Path]:
     """Resolve output paths for PDF, SQLite state, and log file."""
-    pdf_path = Path(get_env_optional("OUTPUT_PDF") or (output_dir / "qms_index.pdf"))
-    db_path = Path(get_env_optional("STATE_DB") or (output_dir / "qms_state.sqlite"))
-    log_path = Path(get_env_optional("LOG_FILE") or (output_dir / "qms_sync.log"))
+    pdf_path = Path(get_env_optional("OUTPUT_PDF") or (output_dir / "gidx_index.pdf"))
+    db_path = Path(get_env_optional("STATE_DB") or (output_dir / "gidx_state.sqlite"))
+    log_path = Path(get_env_optional("LOG_FILE") or (output_dir / "gidx_sync.log"))
     return pdf_path, db_path, log_path
 
 
@@ -891,7 +949,7 @@ def main() -> None:
     print("Step 1: scan PDFs and generate index")
     rows = fetch_local_pdf_rows(root_folder)
     output_dir.mkdir(parents=True, exist_ok=True)
-    export_qms_pdf(rows, pdf_path)
+    export_gidx_pdf(rows, pdf_path)
     index_row = build_index_row(pdf_path)
 
     init_db(db_path)
@@ -925,8 +983,60 @@ def main() -> None:
     allow_removals = _parse_bool_env("ALLOW_REMOVALS", False)
     no_prompt = _parse_bool_env("NO_PROMPT", False)
     safe_replace = _parse_bool_env("SAFE_REPLACE", False)
+    verify_remote = _parse_bool_env("VERIFY_REMOTE", False)
     max_concurrency_raw = _parse_int_env("MAX_CONCURRENCY")
     max_concurrency = max(1, max_concurrency_raw or 1)
+
+    if verify_remote:
+        print("Remote check enabled: verifying stored documents.")
+        action_paths = {str(action.local_path) for action in actions}
+        for row in rows:
+            path = str(row.local_path)
+            if path in action_paths:
+                continue
+            record = state.get(path)
+            if not record:
+                continue
+            remote_name = record.get("remote_document_name") or ""
+            exists = _remote_document_exists(
+                client,
+                store_name,
+                row.file_name,
+                remote_name,
+                allow_fallback=not bool(remote_name),
+            )
+            if not exists:
+                actions.append(
+                    SyncAction(
+                        local_path=row.local_path,
+                        file_name=row.file_name,
+                        modified_ns=row.modified_ns,
+                        size_bytes=row.size_bytes,
+                        action="upload",
+                        remote_document_name=remote_name,
+                    )
+                )
+                action_paths.add(path)
+
+        if index_row and index_action is None:
+            record = state.get(str(index_row.local_path))
+            remote_name = record.get("remote_document_name") if record else ""
+            exists = _remote_document_exists(
+                client,
+                store_name,
+                index_row.file_name,
+                remote_name or "",
+                allow_fallback=not bool(remote_name),
+            )
+            if not exists:
+                index_action = SyncAction(
+                    local_path=index_row.local_path,
+                    file_name=index_row.file_name,
+                    modified_ns=index_row.modified_ns,
+                    size_bytes=index_row.size_bytes,
+                    action="upload",
+                    remote_document_name=remote_name or "",
+                )
 
     total_found = len(rows)
     new_files = sum(1 for action in actions if action.action == "upload")

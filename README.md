@@ -36,12 +36,13 @@ Optional:
 - NO_PROMPT
 - REMOVAL_THRESHOLD
 - SAFE_REPLACE
+- VERIFY_REMOTE
 - MAX_CONCURRENCY
 
 Flow Summary
 Step 1:
 - Scan ROOT_FOLDER for PDFs (skip rules, size/magic checks).
-- Generate qms_index.pdf (chunked table).
+- Generate gidx_index.pdf (chunked table).
 - Update SQLite state DB (includes the index PDF itself).
 
 Step 2 (only if DRY_RUN=0):
@@ -50,7 +51,7 @@ Step 2 (only if DRY_RUN=0):
 - If a local file is removed and ALLOW_REMOVALS=1, delete its remote doc.
 - If removals exceed REMOVAL_THRESHOLD (default 20), prompt before proceeding.
 - If SAFE_REPLACE=1, upload first and delete old remote docs after success.
-- Upload or replace qms_index.pdf only when local content changes.
+- Upload or replace gidx_index.pdf only when local content changes.
 
 Scheduler Notes (Windows Task Scheduler)
 - For unattended runs, set:

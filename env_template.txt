@@ -10,9 +10,9 @@ MAX_FILE_SIZE_MB=       # Max size filter; blank means no limit.
 CHECK_PDF_MAGIC=1       # 1=check PDF header, 0=skip check.
 
 # Optional output paths
-OUTPUT_PDF=             # Override output PDF path (default OUTPUT_DIR\\qms_index.pdf).
-STATE_DB=               # Override state DB path (default OUTPUT_DIR\\qms_state.sqlite).
-LOG_FILE=               # Override log file path (default OUTPUT_DIR\\qms_sync.log).
+OUTPUT_PDF=             # Override output PDF path (default OUTPUT_DIR\\gidx_index.pdf).
+STATE_DB=               # Override state DB path (default OUTPUT_DIR\\gidx_state.sqlite).
+LOG_FILE=               # Override log file path (default OUTPUT_DIR\\gidx_sync.log).
 
 # Run toggle
 DRY_RUN=0               # 1=skip sync, 0=run sync.
@@ -25,4 +25,5 @@ ALLOW_REMOVALS=0        # 1=enable remote deletes for removed local files.
 NO_PROMPT=0             # 1=auto-approve prompts (scheduler mode).
 REMOVAL_THRESHOLD=20    # Prompt if removal count meets/exceeds this value.
 SAFE_REPLACE=0          # 1=upload first, then delete old remote doc.
+VERIFY_REMOTE=0        # 1=verify remote docs exist; re-upload missing docs (slower).
 MAX_CONCURRENCY=1    # Max parallel uploads (default 1).
