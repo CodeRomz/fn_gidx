@@ -29,7 +29,7 @@ DOTENV = Path(__file__).with_name(".env")
 SCAN_SHOW_EVERY = 5
 SKIP_HIDDEN_DIRS = True
 FOLLOW_SYMLINKS = False
-CHUNK_SIZE = 200
+CHUNK_SIZE = 50
 
 
 @dataclass(frozen=True)
