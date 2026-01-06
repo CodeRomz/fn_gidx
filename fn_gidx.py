@@ -18,7 +18,7 @@ try:
 except Exception:  # pragma: no cover - runtime guard if dependency missing
     genai = None
 
-ENV_REFERENCE = Path(__file__).with_name("env_reference.txt")
+ENV_REFERENCE = Path(__file__).with_name("env_template.txt")
 DOTENV = Path(__file__).with_name(".env")
 
 SCAN_SHOW_EVERY = 5
