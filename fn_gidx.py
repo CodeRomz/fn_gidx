@@ -734,6 +734,8 @@ def export_gidx_pdf(rows: List[FileRow], output_path: Path) -> Path:
 
     story = []
     chunk_rows = [header_row]
+    total_rows = len(rows)
+    processed = 0
     for row in rows:
         chunk_rows.append(
             [
@@ -744,19 +746,25 @@ def export_gidx_pdf(rows: List[FileRow], output_path: Path) -> Path:
                 Paragraph(str(row.size_bytes), body_style),
             ]
         )
+        processed += 1
         if len(chunk_rows) - 1 >= CHUNK_SIZE:
             table = Table(chunk_rows, colWidths=col_widths, repeatRows=1, splitByRow=1)
             table.setStyle(table_style)
             story.append(table)
             story.append(Spacer(1, 6))
             chunk_rows = [header_row]
+            print(f"\r[PDF] Rows processed: {processed}/{total_rows}", end="", flush=True)
 
     if len(chunk_rows) > 1:
         table = Table(chunk_rows, colWidths=col_widths, repeatRows=1, splitByRow=1)
         table.setStyle(table_style)
         story.append(table)
+        print(f"\r[PDF] Rows processed: {processed}/{total_rows}", end="", flush=True)
 
     doc.build(story)
+    if total_rows:
+        print()
+    logging.info("PDF rows written: %d", total_rows)
     return output_path
 
 
@@ -1106,6 +1114,7 @@ def configure_logging(log_path: Path) -> None:
         format="%(asctime)s %(levelname)s: %(message)s",
         level=logging.INFO,
     )
+    logging.info("Logging initialized.")
 
 
 def _row_lookup(rows: List[FileRow]) -> Dict[str, FileRow]:
@@ -1135,19 +1144,26 @@ def main() -> None:
     pdf_path, db_path, log_path = build_output_paths(output_dir)
 
     configure_logging(log_path)
+    logging.info("Run started.")
 
     root_folder = Path(root_raw).expanduser().resolve()
     if not root_folder.exists() or not root_folder.is_dir():
         raise ValueError(f"ROOT_FOLDER is not a valid directory: {root_folder}")
 
     print("Step 1: scan PDFs and generate index")
+    logging.info("Scan start: %s", root_folder)
     rows = fetch_local_pdf_rows(root_folder)
+    logging.info("Scan complete: %d PDFs", len(rows))
     output_dir.mkdir(parents=True, exist_ok=True)
+    logging.info("PDF generation start: %s", pdf_path)
     export_gidx_pdf(rows, pdf_path)
+    logging.info("PDF generation complete: %s", pdf_path)
     index_row = build_index_row(pdf_path)
 
+    logging.info("Init DB: %s", db_path)
     init_db(db_path)
     seen_rows = rows + ([index_row] if index_row else [])
+    logging.info("Upsert scan metadata: %d rows", len(seen_rows))
     upsert_seen(db_path, seen_rows)
 
     print(f"Step 1 done: saved PDF to {pdf_path}")
