@@ -25,3 +25,4 @@ ALLOW_REMOVALS=0        # 1=enable remote deletes for removed local files.
 NO_PROMPT=0             # 1=auto-approve prompts (scheduler mode).
 REMOVAL_THRESHOLD=20    # Prompt if removal count meets/exceeds this value.
 SAFE_REPLACE=0          # 1=upload first, then delete old remote doc.
+MAX_CONCURRENCY=1    # Max parallel uploads (default 1).

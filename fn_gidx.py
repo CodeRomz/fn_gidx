@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import sqlite3
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -739,6 +741,65 @@ def upload_pdf_to_gemini(
     return newest.name
 
 
+def _should_retry(exc: Exception) -> bool:
+    """Heuristic retry check for rate-limited or unavailable responses."""
+    code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if isinstance(code, str) and code.isdigit():
+        code = int(code)
+    if code in {429, 503}:
+        return True
+    text = str(exc).lower()
+    tokens = (
+        "429",
+        "too many requests",
+        "resource_exhausted",
+        "rate limit",
+        "rate-limited",
+        "quota",
+        "503",
+        "service unavailable",
+        "unavailable",
+        "temporarily unavailable",
+    )
+    return any(token in text for token in tokens)
+
+
+def _upload_with_retry(
+    client: "genai.Client",
+    store_name: str,
+    row: FileRow,
+    *,
+    max_attempts: int = 5,
+    base_delay: float = 1.0,
+    max_delay: float = 20.0,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Upload with backoff for retryable errors."""
+    for attempt in range(max_attempts):
+        try:
+            document_name = upload_pdf_to_gemini(client, store_name, row.local_path)
+            if not document_name:
+                return None, "Upload failed without a document name."
+            return document_name, None
+        except Exception as exc:
+            if attempt >= max_attempts - 1 or not _should_retry(exc):
+                return None, str(exc)
+            delay = min(max_delay, base_delay * (2 ** attempt))
+            delay += delay * 0.1 * random.random()
+            print(f"[RETRY] upload failed for {row.file_name}: {exc} (retry in {delay:.1f}s)")
+            time.sleep(delay)
+    return None, "Upload failed without a document name."
+
+
+def _upload_worker(store_name: str, row: FileRow) -> Tuple[Optional[str], Optional[str]]:
+    """Upload a PDF with retry; return (document_name, error_message)."""
+    try:
+        client = _build_client()
+        return _upload_with_retry(client, store_name, row)
+    except Exception as exc:
+        return None, str(exc)
+
+
+
 def _choose_document(matches: List[DocumentInfo]) -> Optional[DocumentInfo]:
     """Prompt the user to choose a document when multiple matches exist."""
     if not matches:
@@ -864,6 +925,8 @@ def main() -> None:
     allow_removals = _parse_bool_env("ALLOW_REMOVALS", False)
     no_prompt = _parse_bool_env("NO_PROMPT", False)
     safe_replace = _parse_bool_env("SAFE_REPLACE", False)
+    max_concurrency_raw = _parse_int_env("MAX_CONCURRENCY")
+    max_concurrency = max(1, max_concurrency_raw or 1)
 
     total_found = len(rows)
     new_files = sum(1 for action in actions if action.action == "upload")
@@ -889,63 +952,118 @@ def main() -> None:
         print("Step 2 cancelled by user.")
         return
 
-    for action in actions:
-        row = row_lookup.get(str(action.local_path))
-        if not row:
-            continue
-        try:
-            if action.action == "replace" and not safe_replace:
-                print(f"[REPLACE] {row.file_name} -> deleting old document")
-                delete_remote_document(client, store_name, row.file_name, action.remote_document_name)
-            elif action.action == "replace" and safe_replace:
-                print(f"[REPLACE SAFE] {row.file_name} -> upload then delete old document")
-            elif action.action == "upload":
-                print(f"[UPLOAD] {row.file_name}")
+    if max_concurrency <= 1:
+        for action in actions:
+            row = row_lookup.get(str(action.local_path))
+            if not row:
+                continue
+            try:
+                if action.action == "replace" and not safe_replace:
+                    print(f"[REPLACE] {row.file_name} -> deleting old document")
+                    delete_remote_document(client, store_name, row.file_name, action.remote_document_name)
+                elif action.action == "replace" and safe_replace:
+                    print(f"[REPLACE SAFE] {row.file_name} -> upload then delete old document")
+                elif action.action == "upload":
+                    print(f"[UPLOAD] {row.file_name}")
 
-            document_name = None
-            for attempt in range(2):
-                try:
-                    document_name = upload_pdf_to_gemini(client, store_name, row.local_path)
-                    break
-                except Exception as exc:
-                    if attempt == 0:
-                        print(f"[RETRY] upload failed for {row.file_name}: {exc}")
-                        continue
-                    raise
+                document_name, error = _upload_with_retry(client, store_name, row)
+                if error:
+                    raise RuntimeError(error)
 
-            if document_name is None:
-                raise RuntimeError("Upload failed without a document name.")
+                update_upload_success(db_path, row, document_name)
+                print(f"[DONE] {row.file_name} -> {document_name}")
 
-            update_upload_success(db_path, row, document_name)
-            print(f"[DONE] {row.file_name} -> {document_name}")
-
-            if action.action == "replace" and safe_replace:
-                if no_prompt and not action.remote_document_name:
-                    logging.warning(
-                        "Safe replace cleanup skipped for %s: missing remote_document_name in NO_PROMPT mode.",
-                        row.file_name,
-                    )
-                    print(f"[SKIP] {row.file_name}: missing remote_document_name for safe cleanup")
-                else:
-                    try:
-                        delete_remote_document(
-                            client,
-                            store_name,
-                            row.file_name,
-                            action.remote_document_name,
-                        )
-                    except Exception as exc:
+                if action.action == "replace" and safe_replace:
+                    if no_prompt and not action.remote_document_name:
                         logging.warning(
-                            "Safe replace cleanup failed for %s: %s",
+                            "Safe replace cleanup skipped for %s: missing remote_document_name in NO_PROMPT mode.",
                             row.file_name,
-                            exc,
                         )
-                        print(f"[WARN] cleanup failed for {row.file_name}: {exc}")
-        except Exception as exc:
-            message = str(exc)
-            update_last_error(db_path, row.local_path, message)
-            logging.error("Sync failed for %s: %s", row.file_name, message)
-            print(f"[ERROR] {row.file_name}: {message}")
+                        print(f"[SKIP] {row.file_name}: missing remote_document_name for safe cleanup")
+                    else:
+                        try:
+                            delete_remote_document(
+                                client,
+                                store_name,
+                                row.file_name,
+                                action.remote_document_name,
+                            )
+                        except Exception as exc:
+                            logging.warning(
+                                "Safe replace cleanup failed for %s: %s",
+                                row.file_name,
+                                exc,
+                            )
+                            print(f"[WARN] cleanup failed for {row.file_name}: {exc}")
+            except Exception as exc:
+                message = str(exc)
+                update_last_error(db_path, row.local_path, message)
+                logging.error("Sync failed for %s: %s", row.file_name, message)
+                print(f"[ERROR] {row.file_name}: {message}")
+    else:
+        print(f"Upload concurrency: {max_concurrency}")
+        pending: List[Tuple[SyncAction, FileRow]] = []
+        for action in actions:
+            row = row_lookup.get(str(action.local_path))
+            if not row:
+                continue
+            try:
+                if action.action == "replace" and not safe_replace:
+                    print(f"[REPLACE] {row.file_name} -> deleting old document")
+                    delete_remote_document(client, store_name, row.file_name, action.remote_document_name)
+                elif action.action == "replace" and safe_replace:
+                    print(f"[REPLACE SAFE] {row.file_name} -> upload then delete old document")
+                elif action.action == "upload":
+                    print(f"[UPLOAD] {row.file_name}")
+                pending.append((action, row))
+            except Exception as exc:
+                message = str(exc)
+                update_last_error(db_path, row.local_path, message)
+                logging.error("Sync failed for %s: %s", row.file_name, message)
+                print(f"[ERROR] {row.file_name}: {message}")
+
+        with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
+            future_map = {
+                executor.submit(_upload_worker, store_name, row): (action, row)
+                for action, row in pending
+            }
+            for future in as_completed(future_map):
+                action, row = future_map[future]
+                try:
+                    document_name, error = future.result()
+                except Exception as exc:
+                    document_name, error = None, str(exc)
+                if error:
+                    update_last_error(db_path, row.local_path, error)
+                    logging.error("Sync failed for %s: %s", row.file_name, error)
+                    print(f"[ERROR] {row.file_name}: {error}")
+                    continue
+
+                update_upload_success(db_path, row, document_name)
+                print(f"[DONE] {row.file_name} -> {document_name}")
+
+                if action.action == "replace" and safe_replace:
+                    if no_prompt and not action.remote_document_name:
+                        logging.warning(
+                            "Safe replace cleanup skipped for %s: missing remote_document_name in NO_PROMPT mode.",
+                            row.file_name,
+                        )
+                        print(f"[SKIP] {row.file_name}: missing remote_document_name for safe cleanup")
+                    else:
+                        try:
+                            delete_remote_document(
+                                client,
+                                store_name,
+                                row.file_name,
+                                action.remote_document_name,
+                            )
+                        except Exception as exc:
+                            logging.warning(
+                                "Safe replace cleanup failed for %s: %s",
+                                row.file_name,
+                                exc,
+                            )
+                            print(f"[WARN] cleanup failed for {row.file_name}: {exc}")
 
     removal_threshold_raw = _parse_int_env("REMOVAL_THRESHOLD")
     removal_threshold = removal_threshold_raw if removal_threshold_raw is not None else 20
@@ -1013,19 +1131,9 @@ def main() -> None:
             elif index_action.action == "upload":
                 print(f"[INDEX UPLOAD] {index_row.file_name}")
 
-            document_name = None
-            for attempt in range(2):
-                try:
-                    document_name = upload_pdf_to_gemini(client, store_name, index_row.local_path)
-                    break
-                except Exception as exc:
-                    if attempt == 0:
-                        print(f"[RETRY] upload failed for {index_row.file_name}: {exc}")
-                        continue
-                    raise
-
-            if document_name is None:
-                raise RuntimeError("Upload failed without a document name.")
+            document_name, error = _upload_with_retry(client, store_name, index_row)
+            if error:
+                raise RuntimeError(error)
 
             update_upload_success(db_path, index_row, document_name)
             print(f"[INDEX DONE] {index_row.file_name} -> {document_name}")
