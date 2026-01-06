@@ -51,6 +51,7 @@ class FileRow:
     modified_utc: str
     modified_ns: int
     size_bytes: int
+    display_path: str
 
 
 @dataclass(frozen=True)
@@ -578,6 +579,18 @@ def scan_pdfs_with_progress(
     return sorted(found)
 
 
+def _map_display_path(local_path: Path, root_folder: Path, display_root: str) -> str:
+    """Map a local path to a user-friendly display path if configured."""
+    display_root = (display_root or "").strip()
+    if not display_root:
+        return str(local_path)
+    try:
+        rel = local_path.resolve().relative_to(root_folder.resolve())
+    except Exception:
+        return str(local_path)
+    return str(Path(display_root) / rel)
+
+
 def _modified_utc_from_ns(modified_ns: int) -> str:
     """Convert nanosecond mtime to an ISO-8601 UTC string."""
     dt = datetime.fromtimestamp(modified_ns / 1e9, tz=timezone.utc)
@@ -587,6 +600,7 @@ def _modified_utc_from_ns(modified_ns: int) -> str:
 def fetch_local_pdf_rows(root_folder: Path) -> List[FileRow]:
     """Scan the local filesystem and return rows for indexing."""
     skip_raw = get_env_optional("SKIP_FOLDER")
+    display_root = get_env_optional("ROOT_DISPLAY_PATH")
     max_mb = _parse_int_env("MAX_FILE_SIZE_MB")
     check_magic = _parse_bool_env("CHECK_PDF_MAGIC", True)
     scan_concurrency_raw = _parse_int_env("SCAN_CONCURRENCY")
@@ -628,6 +642,7 @@ def fetch_local_pdf_rows(root_folder: Path) -> List[FileRow]:
                 modified_utc=_modified_utc_from_ns(modified_ns),
                 modified_ns=modified_ns,
                 size_bytes=int(stat.st_size),
+                display_path=_map_display_path(pdf, root_folder, display_root),
             )
         )
     return rows
@@ -649,6 +664,7 @@ def build_index_row(pdf_path: Path) -> Optional[FileRow]:
         modified_utc=_modified_utc_from_ns(modified_ns),
         modified_ns=modified_ns,
         size_bytes=int(stat.st_size),
+        display_path=str(pdf_path),
     )
 
 
@@ -723,7 +739,7 @@ def export_gidx_pdf(rows: List[FileRow], output_path: Path) -> Path:
             [
                 Paragraph(escape(row.file_name), body_style),
                 Paragraph(escape(row.folder), body_style),
-                Paragraph(escape(str(row.local_path)), body_style),
+                Paragraph(escape(row.display_path), body_style),
                 Paragraph(escape(row.modified_utc), body_style),
                 Paragraph(str(row.size_bytes), body_style),
             ]

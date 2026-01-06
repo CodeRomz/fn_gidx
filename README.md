@@ -19,6 +19,7 @@ Quick Start
 Environment Variables
 Required:
 - ROOT_FOLDER
+- ROOT_DISPLAY_PATH
 - OUTPUT_DIR
 - GEMINI_API_KEY
 - FILE_SEARCH_STORE
@@ -45,6 +46,7 @@ Step 1:
 - Scan ROOT_FOLDER for PDFs (skip rules, size/magic checks).
 - Scanning can run in parallel when SCAN_CONCURRENCY > 1 (network shares may benefit).
 - Generate gidx_index.pdf (chunked table).
+- Full Path can be rewritten for readability using ROOT_DISPLAY_PATH.
 - Update SQLite state DB (includes the index PDF itself).
 
 Step 2 (only if DRY_RUN=0):

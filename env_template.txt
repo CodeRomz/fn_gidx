@@ -1,5 +1,6 @@
 # Required
 ROOT_FOLDER=            # Root directory to scan.
+ROOT_DISPLAY_PATH=      # Optional display path for PDF (e.g., O:\QMS).
 OUTPUT_DIR=             # Output folder for index PDF, state DB, and logs.
 GEMINI_API_KEY=         # Google GenAI API key.
 FILE_SEARCH_STORE=      # Store name (short id or fileSearchStores/<id>).
