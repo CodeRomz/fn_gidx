@@ -39,7 +39,7 @@ Optional:
 - REMOVAL_THRESHOLD
 - SAFE_REPLACE
 - VERIFY_REMOTE
-- MAX_CONCURRENCY
+- UPLOAD_CONCURRENCY
 
 Flow Summary
 Step 1:
@@ -51,7 +51,7 @@ Step 1:
 
 Step 2 (only if DRY_RUN=0):
 - Upload new PDFs and replace changed PDFs.
-- Uploads can run in parallel when MAX_CONCURRENCY > 1.
+- Uploads can run in parallel when UPLOAD_CONCURRENCY > 1.
 - If a local file is removed and ALLOW_REMOVALS=1, delete its remote doc.
 - If removals exceed REMOVAL_THRESHOLD (default 20), prompt before proceeding.
 - If SAFE_REPLACE=1, upload first and delete old remote docs after success.

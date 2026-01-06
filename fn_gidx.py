@@ -1178,7 +1178,7 @@ def main() -> None:
     no_prompt = _parse_bool_env("NO_PROMPT", False)
     safe_replace = _parse_bool_env("SAFE_REPLACE", False)
     verify_remote = _parse_bool_env("VERIFY_REMOTE", False)
-    max_concurrency_raw = _parse_int_env("MAX_CONCURRENCY")
+    max_concurrency_raw = _parse_int_env("UPLOAD_CONCURRENCY")
     max_concurrency = max(1, max_concurrency_raw or 1)
 
     if verify_remote:

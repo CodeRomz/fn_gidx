@@ -28,7 +28,7 @@ NO_PROMPT=0             # 1=auto-approve prompts (scheduler mode).
 REMOVAL_THRESHOLD=20    # Prompt if removal count meets/exceeds this value.
 SAFE_REPLACE=0          # 1=upload first, then delete old remote doc.
 VERIFY_REMOTE=0        # 1=verify remote docs exist; re-upload missing docs (slower).
-MAX_CONCURRENCY=1    # Max parallel uploads (default 1).
+UPLOAD_CONCURRENCY=1    # Max parallel uploads (default 1).
 
 # Notes
 # Deleting STATE_DB resets sync history and will re-upload everything.
