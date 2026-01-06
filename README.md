@@ -31,6 +31,8 @@ Optional:
 - SCAN_CONCURRENCY
 - SCAN_SPINNER
 - SCAN_THREAD_LINES
+- PDF_FAST
+- PDF_BUILD_SPINNER
 - OUTPUT_PDF
 - STATE_DB
 - LOG_FILE
@@ -42,6 +44,8 @@ Optional:
 - SAFE_REPLACE
 - VERIFY_REMOTE
 - UPLOAD_CONCURRENCY
+- PERF_TIMING
+- PROFILE_RUN
 
 Flow Summary
 Step 1:
@@ -50,6 +54,8 @@ Step 1:
 - SCAN_SPINNER=1 shows a live scan status line during concurrent scans.
 - SCAN_THREAD_LINES=1 shows one live line per scan thread (ANSI terminals).
 - Generate gidx_index.pdf (chunked table).
+- PDF_FAST=1 uses faster plain-text cells (less formatting overhead).
+- PDF_BUILD_SPINNER=1 shows a spinner during the reportlab build step.
 - Full Path can be rewritten for readability using ROOT_DISPLAY_PATH.
 - Update SQLite state DB (includes the index PDF itself).
 
@@ -60,6 +66,8 @@ Step 2 (only if DRY_RUN=0):
 - If removals exceed REMOVAL_THRESHOLD (default 20), prompt before proceeding.
 - If SAFE_REPLACE=1, upload first and delete old remote docs after success.
 - Upload or replace gidx_index.pdf only when local content changes.
+- PERF_TIMING=1 logs step durations to console and `gidx_sync.log`.
+- PROFILE_RUN=1 saves `OUTPUT_DIR\\gidx_profile.pstats` and prints top 20 calls.
 
 Scheduler Notes (Windows Task Scheduler)
 - For unattended runs, set:

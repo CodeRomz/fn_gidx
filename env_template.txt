@@ -18,6 +18,10 @@ OUTPUT_PDF=             # Override output PDF path (default OUTPUT_DIR\\gidx_ind
 STATE_DB=               # Override state DB path (default OUTPUT_DIR\\gidx_state.sqlite).
 LOG_FILE=               # Override log file path (default OUTPUT_DIR\\gidx_sync.log).
 
+# Optional PDF generation
+PDF_FAST=1              # 1=use faster plain-text cells, 0=use Paragraphs (slower).
+PDF_BUILD_SPINNER=1     # 1=show spinner during PDF build.
+
 # Run toggle
 DRY_RUN=0               # 1=skip sync, 0=run sync.
 
@@ -31,6 +35,10 @@ REMOVAL_THRESHOLD=20    # Prompt if removal count meets/exceeds this value.
 SAFE_REPLACE=0          # 1=upload first, then delete old remote doc.
 VERIFY_REMOTE=0        # 1=verify remote docs exist; re-upload missing docs (slower).
 UPLOAD_CONCURRENCY=1    # Max parallel uploads (default 1).
+
+# Optional profiling
+PERF_TIMING=0           # 1=print/log timing per step.
+PROFILE_RUN=0           # 1=run cProfile and save OUTPUT_DIR\\gidx_profile.pstats.
 
 # Notes
 # Deleting STATE_DB resets sync history and will re-upload everything.

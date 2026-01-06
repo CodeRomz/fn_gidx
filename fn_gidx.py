@@ -29,7 +29,7 @@ DOTENV = Path(__file__).with_name(".env")
 SCAN_SHOW_EVERY = 5
 SKIP_HIDDEN_DIRS = True
 FOLLOW_SYMLINKS = False
-CHUNK_SIZE = 50
+CHUNK_SIZE = 1000
 
 
 @dataclass(frozen=True)
@@ -760,6 +760,9 @@ def export_gidx_pdf(rows: List[FileRow], output_path: Path) -> Path:
     except Exception:
         raise RuntimeError("Missing dependency: install reportlab to generate PDF.")
 
+    pdf_fast = _parse_bool_env("PDF_FAST", True)
+    build_spinner = _parse_bool_env("PDF_BUILD_SPINNER", True)
+
     styles = getSampleStyleSheet()
     header_style = ParagraphStyle(
         "TableHeader",
@@ -806,6 +809,7 @@ def export_gidx_pdf(rows: List[FileRow], output_path: Path) -> Path:
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#D0D5DD")),
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("FONTSIZE", (0, 1), (-1, -1), 8),
             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F6F8FA")]),
             ("LEFTPADDING", (0, 0), (-1, -1), 6),
             ("RIGHTPADDING", (0, 0), (-1, -1), 6),
@@ -819,15 +823,26 @@ def export_gidx_pdf(rows: List[FileRow], output_path: Path) -> Path:
     total_rows = len(rows)
     processed = 0
     for row in rows:
-        chunk_rows.append(
-            [
-                Paragraph(escape(row.file_name), body_style),
-                Paragraph(escape(row.folder), body_style),
-                Paragraph(escape(row.display_path), body_style),
-                Paragraph(escape(row.modified_utc), body_style),
-                Paragraph(str(row.size_bytes), body_style),
-            ]
-        )
+        if pdf_fast:
+            chunk_rows.append(
+                [
+                    row.file_name,
+                    row.folder,
+                    row.display_path,
+                    row.modified_utc,
+                    str(row.size_bytes),
+                ]
+            )
+        else:
+            chunk_rows.append(
+                [
+                    Paragraph(escape(row.file_name), body_style),
+                    Paragraph(escape(row.folder), body_style),
+                    Paragraph(escape(row.display_path), body_style),
+                    Paragraph(escape(row.modified_utc), body_style),
+                    Paragraph(str(row.size_bytes), body_style),
+                ]
+            )
         processed += 1
         if len(chunk_rows) - 1 >= CHUNK_SIZE:
             table = Table(chunk_rows, colWidths=col_widths, repeatRows=1, splitByRow=1)
@@ -843,9 +858,37 @@ def export_gidx_pdf(rows: List[FileRow], output_path: Path) -> Path:
         story.append(table)
         print(f"\r[PDF] Rows processed: {processed}/{total_rows}", end="", flush=True)
 
-    doc.build(story)
+    spinner_thread = None
+    spinner_stop = None
+    printed_build_line = False
+    if build_spinner and total_rows:
+        spinner_stop = Event()
+
+        def _pdf_build_spinner(stop_event: Event) -> None:
+            frames = "|/-\\"
+            index = 0
+            while not stop_event.is_set():
+                print(f"\r[PDF] Building... {frames[index % len(frames)]}", end="", flush=True)
+                index += 1
+                stop_event.wait(0.1)
+            print("\r[PDF] Building... done" + " " * 10, end="", flush=True)
+
+        spinner_thread = threading.Thread(
+            target=_pdf_build_spinner, args=(spinner_stop,), name="pdf-build-spinner", daemon=True
+        )
+        spinner_thread.start()
+
+    try:
+        doc.build(story)
+    finally:
+        if spinner_thread and spinner_stop:
+            spinner_stop.set()
+            spinner_thread.join()
+            print()
+            printed_build_line = True
     if total_rows:
-        print()
+        if not printed_build_line:
+            print()
     logging.info("PDF rows written: %d", total_rows)
     return output_path
 
@@ -1228,37 +1271,69 @@ def main() -> None:
     configure_logging(log_path)
     logging.info("Run started.")
 
+    timing_enabled = _parse_bool_env("PERF_TIMING", False)
+    timings: Dict[str, float] = {}
+
+    def _timing_start(label: str) -> None:
+        if timing_enabled:
+            timings[label] = time.perf_counter()
+
+    def _timing_end(label: str) -> None:
+        if not timing_enabled:
+            return
+        start = timings.pop(label, None)
+        if start is None:
+            return
+        elapsed = time.perf_counter() - start
+        logging.info("TIMING %s: %.2fs", label, elapsed)
+        print(f"[TIMING] {label}: {elapsed:.2f}s")
+
+    def _finish_total() -> None:
+        _timing_end("total")
+
+    _timing_start("total")
+
     root_folder = Path(root_raw).expanduser().resolve()
     if not root_folder.exists() or not root_folder.is_dir():
         raise ValueError(f"ROOT_FOLDER is not a valid directory: {root_folder}")
 
     print("Step 1: scan PDFs and generate index")
     logging.info("Scan start: %s", root_folder)
+    _timing_start("scan_pdfs")
     rows = fetch_local_pdf_rows(root_folder)
+    _timing_end("scan_pdfs")
     logging.info("Scan complete: %d PDFs", len(rows))
     output_dir.mkdir(parents=True, exist_ok=True)
     logging.info("PDF generation start: %s", pdf_path)
+    _timing_start("pdf_build")
     export_gidx_pdf(rows, pdf_path)
+    _timing_end("pdf_build")
     logging.info("PDF generation complete: %s", pdf_path)
     index_row = build_index_row(pdf_path)
 
     logging.info("Init DB: %s", db_path)
+    _timing_start("db_init")
     init_db(db_path)
+    _timing_end("db_init")
     seen_rows = rows + ([index_row] if index_row else [])
     logging.info("Upsert scan metadata: %d rows", len(seen_rows))
+    _timing_start("db_upsert")
     upsert_seen(db_path, seen_rows)
+    _timing_end("db_upsert")
 
     print(f"Step 1 done: saved PDF to {pdf_path}")
 
     dry_run = _parse_bool_env("DRY_RUN", False)
     if dry_run:
         print("Step 2 skipped: DRY_RUN=1")
+        _finish_total()
         return
 
     print("Step 2: sync local PDFs to Gemini File Search Store")
     store_name = _normalize_store(get_env("FILE_SEARCH_STORE"))
     client = _build_client()
 
+    _timing_start("compute_actions")
     state = load_state(db_path)
     actions = compute_actions(rows, state)
     row_lookup = _row_lookup(rows)
@@ -1270,6 +1345,7 @@ def main() -> None:
     has_changes = bool(actions or removed_entries)
     if index_action and index_action.action != "upload" and not has_changes:
         index_action = None
+    _timing_end("compute_actions")
 
     confirm_removals = _parse_bool_env("CONFIRM_REMOVALS", True)
     allow_removals = _parse_bool_env("ALLOW_REMOVALS", False)
@@ -1280,6 +1356,7 @@ def main() -> None:
     max_concurrency = max(1, max_concurrency_raw or 1)
 
     if verify_remote:
+        _timing_start("verify_remote")
         print("Remote check enabled: verifying stored documents.")
         action_paths = {str(action.local_path) for action in actions}
         for row in rows:
@@ -1331,6 +1408,7 @@ def main() -> None:
                     action="upload",
                     remote_document_name=remote_name or "",
                 )
+        _timing_end("verify_remote")
 
     action_map = {str(action.local_path): action for action in actions}
     for row in rows:
@@ -1384,8 +1462,10 @@ def main() -> None:
     if proceed not in {"y", "yes"}:
         logging.info("Sync cancelled by user.")
         print("Step 2 cancelled by user.")
+        _finish_total()
         return
 
+    _timing_start("uploads")
     if max_concurrency <= 1:
         for action in actions:
             row = row_lookup.get(str(action.local_path))
@@ -1499,6 +1579,8 @@ def main() -> None:
                             )
                             print(f"[WARN] cleanup failed for {row.file_name}: {exc}")
 
+    _timing_end("uploads")
+
     removal_threshold_raw = _parse_int_env("REMOVAL_THRESHOLD")
     removal_threshold = removal_threshold_raw if removal_threshold_raw is not None else 20
 
@@ -1528,6 +1610,7 @@ def main() -> None:
             logging.info("Removal sync cancelled by user.")
             removed_entries = []
 
+    _timing_start("removals")
     for record in removed_entries:
         local_path = record.get("local_path") or ""
         file_name = record.get("file_name") or ""
@@ -1552,7 +1635,9 @@ def main() -> None:
                 update_last_error(db_path, Path(local_path), message)
             logging.error("Remove failed for %s: %s", file_name, message)
             print(f"[REMOVE ERROR] {file_name}: {message}")
+    _timing_end("removals")
 
+    _timing_start("index_sync")
     if index_action and index_row:
         try:
             if index_action.action == "replace" and not safe_replace:
@@ -1597,13 +1682,32 @@ def main() -> None:
             update_last_error(db_path, index_row.local_path, message)
             logging.error("Index sync failed for %s: %s", index_row.file_name, message)
             print(f"[INDEX ERROR] {index_row.file_name}: {message}")
+    _timing_end("index_sync")
 
     print("Step 2 done: sync complete.")
+    _finish_total()
 
 
 if __name__ == "__main__":
     try:
-        main()
+        load_environment()
+        if _parse_bool_env("PROFILE_RUN", False):
+            output_dir = Path(get_env("OUTPUT_DIR"))
+            output_dir.mkdir(parents=True, exist_ok=True)
+            profile_path = output_dir / "gidx_profile.pstats"
+            import cProfile
+            import pstats
+
+            profiler = cProfile.Profile()
+            profiler.enable()
+            main()
+            profiler.disable()
+            profiler.dump_stats(str(profile_path))
+            stats = pstats.Stats(profiler).sort_stats("cumtime")
+            stats.print_stats(20)
+            print(f"[PROFILE] Saved to {profile_path}")
+        else:
+            main()
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
         sys.exit(130)
