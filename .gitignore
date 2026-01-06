@@ -84,7 +84,12 @@ secrets.env
 # System
 .idea/
 .vscode/
+
+#Other
 AGENTS.md
 package-lock.json
 package.json
 node_modules
+
+PSEUDOCODE.md
+codex_hist.txt
