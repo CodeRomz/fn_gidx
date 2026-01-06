@@ -8,6 +8,7 @@ import random
 import sqlite3
 import sys
 import threading
+from threading import Event
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -372,6 +373,8 @@ def _scan_pdfs_concurrent(
     check_magic: bool,
     max_mb: Optional[int],
     scan_concurrency: int,
+    spinner_enabled: bool,
+    thread_lines: bool,
 ) -> List[Path]:
     """Concurrent directory scan using a work queue."""
     found: List[Path] = []
@@ -382,6 +385,53 @@ def _scan_pdfs_concurrent(
     visited_entries = 0
     visited_files = 0
     start = time.monotonic()
+    active_workers = 0
+    spinner_chars = '|/-\\'
+    spinner_index = 0
+    stop_event = Event()
+
+    def _ansi_move_up(lines: int) -> None:
+        if lines <= 0:
+            return
+        print(f"\033[{lines}A", end="")
+
+    def _ansi_clear_line() -> None:
+        print("\r\033[2K", end="")
+
+    thread_states = ["idle"] * scan_concurrency
+    thread_dirs = [""] * scan_concurrency
+
+    def render_thread_lines() -> None:
+        if not thread_lines:
+            return
+        _ansi_move_up(scan_concurrency)
+        with lock:
+            states = list(thread_states)
+            dirs = list(thread_dirs)
+        for idx in range(scan_concurrency):
+            _ansi_clear_line()
+            print(f"[SCAN-{idx+1}] {states[idx]} {dirs[idx]}")
+    def status_line() -> None:
+        nonlocal spinner_index
+        while not stop_event.is_set():
+            with lock:
+                ch = spinner_chars[spinner_index % len(spinner_chars)]
+                spinner_index += 1
+                q_len = len(queue)
+                active = active_workers
+                entries = visited_entries
+                files = visited_files
+                found_count = len(found)
+            print(
+                f"\r[SCAN] {ch} Q={q_len} Active={active} Entries={entries} Files={files} Found={found_count}",
+                end="",
+                flush=True,
+            )
+            if thread_lines:
+                print()
+                render_thread_lines()
+                _ansi_move_up(1)
+            time.sleep(0.5)
 
     def log_progress() -> None:
         elapsed = time.monotonic() - start
@@ -392,77 +442,89 @@ def _scan_pdfs_concurrent(
             flush=True,
         )
 
-    def worker() -> None:
-        nonlocal visited_entries, visited_files
+    def worker(thread_id: int) -> None:
+        nonlocal visited_entries, visited_files, active_workers
         while True:
             with lock:
                 if not queue:
                     return
                 current_dir = queue.popleft()
+                active_workers += 1
+                if thread_lines:
+                    thread_states[thread_id] = "scan"
+                    thread_dirs[thread_id] = str(current_dir)
             try:
-                current_dir = current_dir.resolve()
-            except Exception:
-                continue
-
-            with lock:
-                if current_dir in visited_dirs:
-                    continue
-                visited_dirs.add(current_dir)
-                visited_entries += 1
-                if visited_entries % SCAN_SHOW_EVERY == 0:
-                    log_progress()
-
-            if any(is_subpath(current_dir, sd) for sd in skip_dirs):
-                with lock:
-                    print(f"\r[SCAN][SKIP] {current_dir} (matches SKIP_FOLDER)" + " " * 20)
-                continue
-
-            try:
-                with os.scandir(current_dir) as it:
-                    entries = list(it)
-            except Exception as exc:
-                logging.warning("Scan failed for %s: %s", current_dir, exc)
-                continue
-
-            for entry in entries:
                 try:
-                    if entry.is_dir(follow_symlinks=FOLLOW_SYMLINKS):
-                        if SKIP_HIDDEN_DIRS and entry.name.startswith("."):
-                            continue
-                        with lock:
-                            queue.append(Path(entry.path))
-                        continue
-
-                    if not entry.is_file(follow_symlinks=FOLLOW_SYMLINKS):
-                        continue
-
-                    with lock:
-                        visited_entries += 1
-                        visited_files += 1
-                        if visited_entries % SCAN_SHOW_EVERY == 0:
-                            log_progress()
-
-                    if not entry.name.lower().endswith(".pdf"):
-                        continue
-
-                    p = Path(entry.path)
-
-                    if check_magic and not looks_like_pdf(p, check_magic=check_magic):
-                        with lock:
-                            print(f"\r[SCAN][SKIP] {p} (invalid PDF header)" + " " * 20)
-                        continue
-
-                    ok, reason = preflight_size_ok(p, max_mb)
-                    if not ok:
-                        with lock:
-                            print(f"\r[SCAN][SKIP] {p} ({reason})" + " " * 20)
-                        continue
-
-                    with lock:
-                        found.append(p)
+                    current_dir = current_dir.resolve()
                 except Exception as exc:
-                    logging.warning("Scan entry failed for %s: %s", entry.path, exc)
+                    logging.warning("Resolve failed for %s: %s", current_dir, exc)
                     continue
+
+                with lock:
+                    if current_dir in visited_dirs:
+                        continue
+                    visited_dirs.add(current_dir)
+                    visited_entries += 1
+                    if visited_entries % SCAN_SHOW_EVERY == 0:
+                        log_progress()
+
+                if any(is_subpath(current_dir, sd) for sd in skip_dirs):
+                    with lock:
+                        print(f"\r[SCAN][SKIP] {current_dir} (matches SKIP_FOLDER)" + " " * 20)
+                    continue
+
+                try:
+                    with os.scandir(current_dir) as it:
+                        entries = list(it)
+                except Exception as exc:
+                    logging.warning("Scan failed for %s: %s", current_dir, exc)
+                    continue
+
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=FOLLOW_SYMLINKS):
+                            if SKIP_HIDDEN_DIRS and entry.name.startswith("."):
+                                continue
+                            with lock:
+                                queue.append(Path(entry.path))
+                            continue
+
+                        if not entry.is_file(follow_symlinks=FOLLOW_SYMLINKS):
+                            continue
+
+                        with lock:
+                            visited_entries += 1
+                            visited_files += 1
+                            if visited_entries % SCAN_SHOW_EVERY == 0:
+                                log_progress()
+
+                        if not entry.name.lower().endswith(".pdf"):
+                            continue
+
+                        p = Path(entry.path)
+
+                        if check_magic and not looks_like_pdf(p, check_magic=check_magic):
+                            with lock:
+                                print(f"\r[SCAN][SKIP] {p} (invalid PDF header)" + " " * 20)
+                            continue
+
+                        ok, reason = preflight_size_ok(p, max_mb)
+                        if not ok:
+                            with lock:
+                                print(f"\r[SCAN][SKIP] {p} ({reason})" + " " * 20)
+                            continue
+
+                        with lock:
+                            found.append(p)
+                    except Exception as exc:
+                        logging.warning("Scan entry failed for %s: %s", entry.path, exc)
+                        continue
+            finally:
+                with lock:
+                    active_workers -= 1
+                    if thread_lines:
+                        thread_states[thread_id] = "idle"
+                        thread_dirs[thread_id] = ""
 
     print(f"[SCAN] Starting concurrent scan: {root} (threads={scan_concurrency})")
     if skip_dirs:
@@ -470,11 +532,23 @@ def _scan_pdfs_concurrent(
         for s in skip_dirs:
             print(f"       - {s}")
 
-    threads = [threading.Thread(target=worker, daemon=True) for _ in range(scan_concurrency)]
+    if thread_lines:
+        print("\n" * scan_concurrency, end="")
+
+    status_thread = None
+    if spinner_enabled:
+        status_thread = threading.Thread(target=status_line, daemon=True)
+        status_thread.start()
+
+    threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(scan_concurrency)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
+
+    stop_event.set()
+    if status_thread:
+        status_thread.join(timeout=1)
 
     print()
     elapsed = time.monotonic() - start
@@ -489,6 +563,8 @@ def scan_pdfs_with_progress(
     check_magic: bool,
     max_mb: Optional[int],
     scan_concurrency: int,
+    spinner_enabled: bool,
+    thread_lines: bool,
 ) -> List[Path]:
     """Recursively scan for PDFs with live progress."""
     if scan_concurrency > 1:
@@ -498,6 +574,8 @@ def scan_pdfs_with_progress(
             check_magic=check_magic,
             max_mb=max_mb,
             scan_concurrency=scan_concurrency,
+            spinner_enabled=spinner_enabled,
+            thread_lines=thread_lines,
         )
 
     found: List[Path] = []
@@ -605,6 +683,8 @@ def fetch_local_pdf_rows(root_folder: Path) -> List[FileRow]:
     check_magic = _parse_bool_env("CHECK_PDF_MAGIC", True)
     scan_concurrency_raw = _parse_int_env("SCAN_CONCURRENCY")
     scan_concurrency = max(1, scan_concurrency_raw or 1)
+    spinner_enabled = _parse_bool_env("SCAN_SPINNER", True)
+    thread_lines = _parse_bool_env("SCAN_THREAD_LINES", False)
 
     skip_dirs = parse_skip_folders(skip_raw, root_folder)
     output_dir_raw = get_env_optional("OUTPUT_DIR")
@@ -621,6 +701,8 @@ def fetch_local_pdf_rows(root_folder: Path) -> List[FileRow]:
         check_magic=check_magic,
         max_mb=max_mb,
         scan_concurrency=scan_concurrency,
+        spinner_enabled=spinner_enabled,
+        thread_lines=thread_lines,
     )
 
     rows: List[FileRow] = []

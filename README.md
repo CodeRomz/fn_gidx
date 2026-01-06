@@ -29,6 +29,8 @@ Optional:
 - MAX_FILE_SIZE_MB
 - CHECK_PDF_MAGIC
 - SCAN_CONCURRENCY
+- SCAN_SPINNER
+- SCAN_THREAD_LINES
 - OUTPUT_PDF
 - STATE_DB
 - LOG_FILE
@@ -45,6 +47,8 @@ Flow Summary
 Step 1:
 - Scan ROOT_FOLDER for PDFs (skip rules, size/magic checks).
 - Scanning can run in parallel when SCAN_CONCURRENCY > 1 (network shares may benefit).
+- SCAN_SPINNER=1 shows a live scan status line during concurrent scans.
+- SCAN_THREAD_LINES=1 shows one live line per scan thread (ANSI terminals).
 - Generate gidx_index.pdf (chunked table).
 - Full Path can be rewritten for readability using ROOT_DISPLAY_PATH.
 - Update SQLite state DB (includes the index PDF itself).
