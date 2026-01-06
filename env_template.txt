@@ -1,0 +1,27 @@
+# Required
+ROOT_FOLDER=            # Root directory to scan.
+OUTPUT_DIR=             # Output folder for index PDF, state DB, and logs.
+GEMINI_API_KEY=         # Google GenAI API key.
+FILE_SEARCH_STORE=      # Store name (short id or fileSearchStores/<id>).
+
+# Optional scan controls
+SKIP_FOLDER=            # Folders to skip (comma/semicolon list).
+MAX_FILE_SIZE_MB=       # Max size filter; blank means no limit.
+CHECK_PDF_MAGIC=1       # 1=check PDF header, 0=skip check.
+
+# Optional output paths
+OUTPUT_PDF=             # Override output PDF path (default OUTPUT_DIR\\qms_index.pdf).
+STATE_DB=               # Override state DB path (default OUTPUT_DIR\\qms_state.sqlite).
+LOG_FILE=               # Override log file path (default OUTPUT_DIR\\qms_sync.log).
+
+# Run toggle
+DRY_RUN=0               # 1=skip sync, 0=run sync.
+
+# Prompt before remote deletions
+CONFIRM_REMOVALS=1      # 1=ask before deleting remote docs.
+
+# Allow deletions and control prompts
+ALLOW_REMOVALS=0        # 1=enable remote deletes for removed local files.
+NO_PROMPT=0             # 1=auto-approve prompts (scheduler mode).
+REMOVAL_THRESHOLD=20    # Prompt if removal count meets/exceeds this value.
+SAFE_REPLACE=0          # 1=upload first, then delete old remote doc.
