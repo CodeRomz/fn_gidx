@@ -676,6 +676,27 @@ def _action_for_row(row: FileRow, record: Optional[Dict[str, Optional[str]]]) ->
     return None
 
 
+def _action_reason(
+    row: FileRow,
+    record: Optional[Dict[str, Optional[str]]],
+    action: Optional[SyncAction],
+) -> str:
+    """Describe why a file is uploaded, replaced, or skipped."""
+    if action is None:
+        return "unchanged"
+    if action.action == "replace":
+        return "modified"
+    if action.action == "upload":
+        if record is None:
+            return "new"
+        last_uploaded_ns = record.get("last_uploaded_ns")
+        last_uploaded_size = record.get("last_uploaded_size")
+        if last_uploaded_ns is None or last_uploaded_size is None:
+            return "never_uploaded"
+        return "forced_upload"
+    return action.action
+
+
 def compute_actions(rows: List[FileRow], state: Dict[str, Dict[str, Optional[str]]]) -> List[SyncAction]:
     """Compute upload/replace actions based on last uploaded metadata."""
     actions: List[SyncAction] = []
@@ -1006,6 +1027,7 @@ def main() -> None:
                 allow_fallback=not bool(remote_name),
             )
             if not exists:
+                logging.info("REMOTE MISSING: scheduling upload for %s", row.local_path)
                 actions.append(
                     SyncAction(
                         local_path=row.local_path,
@@ -1029,6 +1051,7 @@ def main() -> None:
                 allow_fallback=not bool(remote_name),
             )
             if not exists:
+                logging.info("REMOTE MISSING: scheduling index upload for %s", index_row.local_path)
                 index_action = SyncAction(
                     local_path=index_row.local_path,
                     file_name=index_row.file_name,
@@ -1037,6 +1060,35 @@ def main() -> None:
                     action="upload",
                     remote_document_name=remote_name or "",
                 )
+
+    action_map = {str(action.local_path): action for action in actions}
+    for row in rows:
+        path = str(row.local_path)
+        record = state.get(path)
+        action = action_map.get(path)
+        reason = _action_reason(row, record, action)
+        if action:
+            logging.info(
+                "ACTION %s: %s (%s)",
+                action.action.upper(),
+                row.local_path,
+                reason,
+            )
+        else:
+            logging.info("SKIP: %s (%s)", row.local_path, reason)
+
+    if index_row:
+        record = state.get(str(index_row.local_path))
+        reason = _action_reason(index_row, record, index_action)
+        if index_action:
+            logging.info(
+                "INDEX ACTION %s: %s (%s)",
+                index_action.action.upper(),
+                index_row.local_path,
+                reason,
+            )
+        else:
+            logging.info("INDEX SKIP: %s (%s)", index_row.local_path, reason)
 
     total_found = len(rows)
     new_files = sum(1 for action in actions if action.action == "upload")
@@ -1059,6 +1111,7 @@ def main() -> None:
     else:
         proceed = input("Proceed with sync? [y/N]: ").strip().lower()
     if proceed not in {"y", "yes"}:
+        logging.info("Sync cancelled by user.")
         print("Step 2 cancelled by user.")
         return
 
@@ -1180,6 +1233,7 @@ def main() -> None:
 
     if removed_entries and not allow_removals:
         removed_entries = []
+        logging.info("Removal sync skipped: ALLOW_REMOVALS=0.")
         print("Removal sync skipped: set ALLOW_REMOVALS=1 to enable.")
 
     if removed_entries and len(removed_entries) >= removal_threshold:
@@ -1191,6 +1245,7 @@ def main() -> None:
             msg = f"Removal count {len(removed_entries)} exceeds threshold {removal_threshold}. Proceed? [y/N]: "
             proceed_threshold = input(msg).strip().lower()
             if proceed_threshold not in {"y", "yes"}:
+                logging.info("Removal sync cancelled by user at threshold prompt.")
                 removed_entries = []
 
     if removed_entries and confirm_removals:
@@ -1199,6 +1254,7 @@ def main() -> None:
         else:
             proceed_removals = input("Proceed with removal sync? [y/N]: ").strip().lower()
         if proceed_removals not in {"y", "yes"}:
+            logging.info("Removal sync cancelled by user.")
             removed_entries = []
 
     for record in removed_entries:

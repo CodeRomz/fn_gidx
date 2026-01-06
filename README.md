@@ -65,3 +65,17 @@ Safety Tips
 - Keep OUTPUT_DIR outside ROOT_FOLDER to avoid accidental indexing loops.
 - If you change ROOT_FOLDER or SKIP_FOLDER, review removals before enabling
   ALLOW_REMOVALS.
+
+Operational Notes
+- Deleting `OUTPUT_DIR\\gidx_index.pdf` is safe. It is regenerated on the next run
+  and uploaded again if it changes or if `VERIFY_REMOTE=1` finds it missing.
+- Deleting `OUTPUT_DIR\\gidx_state.sqlite` resets local sync state. The next run
+  treats every local PDF as new and uploads them again, which can create duplicate
+  remote documents if the store already contains prior uploads. Removals are not
+  triggered from an empty state.
+
+Recommended Files to Keep
+- `OUTPUT_DIR\\gidx_state.sqlite` preserves upload history and prevents duplicates.
+- `OUTPUT_DIR\\gidx_index.pdf` is the generated index artifact; safe to delete but
+  useful for local review.
+- `OUTPUT_DIR\\gidx_sync.log` helps diagnose sync issues and retries.
