@@ -27,6 +27,7 @@ ehthumbs.db
 *.pot
 *.mo
 *.sqlite3
+*.sqlite
 *.db
 
 # Python egg metadata
