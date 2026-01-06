@@ -1,7 +1,7 @@
 Gemini Index Sync (GIDX)
 
 Purpose
-This tool scans a local QMS PDF directory, generates a searchable index PDF,
+This tool scans a local directory, generates a searchable index PDF,
 and keeps a Gemini File Search Store in sync (uploads, replaces, and removals).
 The local directory is the source of truth.
 
