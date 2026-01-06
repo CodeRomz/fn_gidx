@@ -7,7 +7,9 @@ import os
 import random
 import sqlite3
 import sys
+import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -299,6 +301,15 @@ def _remote_document_exists(
     return bool(matches)
 
 
+def _safe_stat(path: Path) -> Optional[os.stat_result]:
+    """Return stat for a path or log a warning and return None."""
+    try:
+        return path.stat()
+    except Exception as exc:
+        logging.warning("Stat failed for %s: %s", path, exc)
+        return None
+
+
 def looks_like_pdf(path: Path, *, check_magic: bool) -> bool:
     """Verify PDF magic bytes."""
     if not check_magic:
@@ -306,7 +317,8 @@ def looks_like_pdf(path: Path, *, check_magic: bool) -> bool:
     try:
         with path.open("rb") as handle:
             return handle.read(4) == b"%PDF"
-    except Exception:
+    except Exception as exc:
+        logging.warning("Failed PDF magic check for %s: %s", path, exc)
         return False
 
 
@@ -314,13 +326,13 @@ def preflight_size_ok(path: Path, max_mb: Optional[int]) -> Tuple[bool, Optional
     """Check if file size is within limits."""
     if max_mb is None or max_mb <= 0:
         return True, None
-    try:
-        size_mb = path.stat().st_size / (1024 * 1024)
-        if size_mb > max_mb:
-            return False, f"exceeds {max_mb}MB limit"
-        return True, None
-    except Exception as exc:
-        return False, f"stat error: {exc}"
+    stat = _safe_stat(path)
+    if stat is None:
+        return False, "stat error"
+    size_mb = stat.st_size / (1024 * 1024)
+    if size_mb > max_mb:
+        return False, f"exceeds {max_mb}MB limit"
+    return True, None
 
 
 def parse_skip_folders(raw_value: str, root: Path) -> List[Path]:
@@ -352,14 +364,141 @@ def is_subpath(path: Path, parent: Path) -> bool:
         return False
 
 
+def _scan_pdfs_concurrent(
+    root: Path,
+    skip_dirs: List[Path],
+    *,
+    check_magic: bool,
+    max_mb: Optional[int],
+    scan_concurrency: int,
+) -> List[Path]:
+    """Concurrent directory scan using a work queue."""
+    found: List[Path] = []
+    visited_dirs: set[Path] = set()
+    queue = deque([root])
+    lock = threading.Lock()
+
+    visited_entries = 0
+    visited_files = 0
+    start = time.monotonic()
+
+    def log_progress() -> None:
+        elapsed = time.monotonic() - start
+        print(
+            f"\r[SCAN] Entries={visited_entries} Files={visited_files} Found={len(found)} "
+            f"Elapsed={elapsed:.1f}s",
+            end="",
+            flush=True,
+        )
+
+    def worker() -> None:
+        nonlocal visited_entries, visited_files
+        while True:
+            with lock:
+                if not queue:
+                    return
+                current_dir = queue.popleft()
+            try:
+                current_dir = current_dir.resolve()
+            except Exception:
+                continue
+
+            with lock:
+                if current_dir in visited_dirs:
+                    continue
+                visited_dirs.add(current_dir)
+                visited_entries += 1
+                if visited_entries % SCAN_SHOW_EVERY == 0:
+                    log_progress()
+
+            if any(is_subpath(current_dir, sd) for sd in skip_dirs):
+                with lock:
+                    print(f"\r[SCAN][SKIP] {current_dir} (matches SKIP_FOLDER)" + " " * 20)
+                continue
+
+            try:
+                with os.scandir(current_dir) as it:
+                    entries = list(it)
+            except Exception as exc:
+                logging.warning("Scan failed for %s: %s", current_dir, exc)
+                continue
+
+            for entry in entries:
+                try:
+                    if entry.is_dir(follow_symlinks=FOLLOW_SYMLINKS):
+                        if SKIP_HIDDEN_DIRS and entry.name.startswith("."):
+                            continue
+                        with lock:
+                            queue.append(Path(entry.path))
+                        continue
+
+                    if not entry.is_file(follow_symlinks=FOLLOW_SYMLINKS):
+                        continue
+
+                    with lock:
+                        visited_entries += 1
+                        visited_files += 1
+                        if visited_entries % SCAN_SHOW_EVERY == 0:
+                            log_progress()
+
+                    if not entry.name.lower().endswith(".pdf"):
+                        continue
+
+                    p = Path(entry.path)
+
+                    if check_magic and not looks_like_pdf(p, check_magic=check_magic):
+                        with lock:
+                            print(f"\r[SCAN][SKIP] {p} (invalid PDF header)" + " " * 20)
+                        continue
+
+                    ok, reason = preflight_size_ok(p, max_mb)
+                    if not ok:
+                        with lock:
+                            print(f"\r[SCAN][SKIP] {p} ({reason})" + " " * 20)
+                        continue
+
+                    with lock:
+                        found.append(p)
+                except Exception as exc:
+                    logging.warning("Scan entry failed for %s: %s", entry.path, exc)
+                    continue
+
+    print(f"[SCAN] Starting concurrent scan: {root} (threads={scan_concurrency})")
+    if skip_dirs:
+        print("[SCAN] Skipping folders:")
+        for s in skip_dirs:
+            print(f"       - {s}")
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(scan_concurrency)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    print()
+    elapsed = time.monotonic() - start
+    print(f"[SCAN] Complete: {len(found)} PDFs | {visited_files} files scanned | {elapsed:.1f}s")
+    return sorted(found)
+
+
 def scan_pdfs_with_progress(
     root: Path,
     skip_dirs: List[Path],
     *,
     check_magic: bool,
     max_mb: Optional[int],
+    scan_concurrency: int,
 ) -> List[Path]:
     """Recursively scan for PDFs with live progress."""
+    if scan_concurrency > 1:
+        return _scan_pdfs_concurrent(
+            root,
+            skip_dirs,
+            check_magic=check_magic,
+            max_mb=max_mb,
+            scan_concurrency=scan_concurrency,
+        )
+
     found: List[Path] = []
     visited_entries = 0
     visited_files = 0
@@ -372,8 +511,19 @@ def scan_pdfs_with_progress(
 
     start = time.monotonic()
 
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=FOLLOW_SYMLINKS):
-        current_dir = Path(dirpath).resolve()
+    def _walk_error(exc: OSError) -> None:
+        logging.warning("Walk error at %s: %s", getattr(exc, "filename", ""), exc)
+
+    for dirpath, dirnames, filenames in os.walk(
+        root,
+        followlinks=FOLLOW_SYMLINKS,
+        onerror=_walk_error,
+    ):
+        try:
+            current_dir = Path(dirpath).resolve()
+        except Exception as exc:
+            logging.warning("Resolve failed for %s: %s", dirpath, exc)
+            continue
 
         visited_entries += 1
         if visited_entries % SCAN_SHOW_EVERY == 0:
@@ -439,6 +589,8 @@ def fetch_local_pdf_rows(root_folder: Path) -> List[FileRow]:
     skip_raw = get_env_optional("SKIP_FOLDER")
     max_mb = _parse_int_env("MAX_FILE_SIZE_MB")
     check_magic = _parse_bool_env("CHECK_PDF_MAGIC", True)
+    scan_concurrency_raw = _parse_int_env("SCAN_CONCURRENCY")
+    scan_concurrency = max(1, scan_concurrency_raw or 1)
 
     skip_dirs = parse_skip_folders(skip_raw, root_folder)
     output_dir_raw = get_env_optional("OUTPUT_DIR")
@@ -449,13 +601,18 @@ def fetch_local_pdf_rows(root_folder: Path) -> List[FileRow]:
             skip_dirs.append(output_dir)
         except Exception:
             pass
-    pdfs = scan_pdfs_with_progress(root_folder, skip_dirs, check_magic=check_magic, max_mb=max_mb)
+    pdfs = scan_pdfs_with_progress(
+        root_folder,
+        skip_dirs,
+        check_magic=check_magic,
+        max_mb=max_mb,
+        scan_concurrency=scan_concurrency,
+    )
 
     rows: List[FileRow] = []
     for pdf in pdfs:
-        try:
-            stat = pdf.stat()
-        except Exception:
+        stat = _safe_stat(pdf)
+        if stat is None:
             continue
         modified_ns = int(stat.st_mtime_ns)
         rel_folder = ""

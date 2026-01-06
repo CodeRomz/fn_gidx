@@ -8,6 +8,7 @@ FILE_SEARCH_STORE=      # Store name (short id or fileSearchStores/<id>).
 SKIP_FOLDER=            # Folders to skip (comma/semicolon list).
 MAX_FILE_SIZE_MB=       # Max size filter; blank means no limit.
 CHECK_PDF_MAGIC=1       # 1=check PDF header, 0=skip check.
+SCAN_CONCURRENCY=1     # Max parallel directory scans (default 1).
 
 # Optional output paths
 OUTPUT_PDF=             # Override output PDF path (default OUTPUT_DIR\\gidx_index.pdf).

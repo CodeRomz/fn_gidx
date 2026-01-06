@@ -27,6 +27,7 @@ Optional:
 - SKIP_FOLDER
 - MAX_FILE_SIZE_MB
 - CHECK_PDF_MAGIC
+- SCAN_CONCURRENCY
 - OUTPUT_PDF
 - STATE_DB
 - LOG_FILE
@@ -42,6 +43,7 @@ Optional:
 Flow Summary
 Step 1:
 - Scan ROOT_FOLDER for PDFs (skip rules, size/magic checks).
+- Scanning can run in parallel when SCAN_CONCURRENCY > 1 (network shares may benefit).
 - Generate gidx_index.pdf (chunked table).
 - Update SQLite state DB (includes the index PDF itself).
 
