@@ -6,6 +6,7 @@ import logging
 import os
 import random
 import sqlite3
+import subprocess
 import sys
 import threading
 from threading import Event
@@ -23,6 +24,13 @@ try:
 except Exception:  # pragma: no cover - runtime guard if dependency missing
     genai = None
 
+try:
+    import vertexai
+    from vertexai import rag
+except Exception:  # pragma: no cover - runtime guard if dependency missing
+    vertexai = None
+    rag = None
+
 ENV_REFERENCE = Path(__file__).with_name("env_reference.txt")
 DOTENV = Path(__file__).with_name(".env")
 
@@ -30,6 +38,10 @@ SCAN_SHOW_EVERY = 5
 SKIP_HIDDEN_DIRS = True
 FOLLOW_SYMLINKS = False
 CHUNK_SIZE = 1000
+BACKEND_GEMINI = "gemini_file_search"
+BACKEND_VERTEX = "vertex_rag"
+_VERTEX_INIT_LOCK = threading.Lock()
+_VERTEX_INIT_TARGET: Tuple[str, str] = ("", "")
 
 
 @dataclass(frozen=True)
@@ -65,6 +77,17 @@ class SyncAction:
     size_bytes: int
     action: str
     remote_document_name: str
+
+
+@dataclass(frozen=True)
+class SyncBackendConfig:
+    """Runtime configuration for the selected sync backend."""
+
+    backend: str
+    store_name: str = ""
+    vertex_project_id: str = ""
+    vertex_location: str = ""
+    vertex_corpus_name: str = ""
 
 
 def _load_env_file(path: Path, *, override: bool) -> None:
@@ -137,6 +160,275 @@ def _get_attr(obj: object, key: str, default: str = "") -> str:
     if isinstance(obj, dict):
         return str(obj.get(key, default) or "")
     return str(getattr(obj, key, default) or "")
+
+
+def _get_attr_any(obj: object, keys: Iterable[str], default: str = "") -> str:
+    """Fetch the first non-empty value from candidate keys."""
+    for key in keys:
+        value = _get_attr(obj, key, "")
+        if value:
+            return value
+    return default
+
+
+def _normalize_backend(raw_backend: str) -> str:
+    """Normalize backend aliases to internal backend constants."""
+    raw = (raw_backend or "").strip().lower()
+    mapping = {
+        "gemini": BACKEND_GEMINI,
+        BACKEND_GEMINI: BACKEND_GEMINI,
+        "vertex": BACKEND_VERTEX,
+        BACKEND_VERTEX: BACKEND_VERTEX,
+    }
+    if raw not in mapping:
+        raise ValueError(
+            "Invalid SYNC_BACKEND. Use 'gemini_file_search' or 'vertex_rag'."
+        )
+    return mapping[raw]
+
+
+def resolve_sync_backend() -> str:
+    """Resolve sync backend from explicit SYNC_BACKEND only."""
+    explicit = get_env("SYNC_BACKEND")
+    return _normalize_backend(explicit)
+
+
+def _backend_label(backend: str) -> str:
+    """User-friendly backend label."""
+    if backend == BACKEND_VERTEX:
+        return "Vertex RAG"
+    return "Gemini File Search"
+
+
+def _ensure_vertex_runtime() -> None:
+    """Fail fast if Vertex dependencies are unavailable."""
+    if vertexai is None or rag is None:
+        raise RuntimeError(
+            "Missing dependency: install google-cloud-aiplatform for Vertex RAG backend."
+        )
+
+
+def _init_vertex(project_id: str, location: str) -> None:
+    """Initialize Vertex AI SDK once per (project, location)."""
+    global _VERTEX_INIT_TARGET
+    _ensure_vertex_runtime()
+    target = ((project_id or "").strip(), (location or "").strip())
+    if not all(target):
+        raise ValueError("VERTEX_PROJECT_ID and VERTEX_LOCATION are required for Vertex RAG.")
+    with _VERTEX_INIT_LOCK:
+        if _VERTEX_INIT_TARGET == target:
+            return
+        vertexai.init(project=target[0], location=target[1])
+        _VERTEX_INIT_TARGET = target
+
+
+def _check_vertex_adc() -> Tuple[bool, Optional[str]]:
+    """Return whether ADC credentials are usable for Vertex calls."""
+    try:
+        from google.auth import default as google_auth_default
+        from google.auth.transport.requests import Request
+    except Exception as exc:
+        return False, f"google-auth is unavailable: {exc}"
+
+    try:
+        credentials, _ = google_auth_default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        credentials.refresh(Request())
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def ensure_vertex_auth(
+    project_id: str,
+    *,
+    no_prompt: bool,
+    interactive_login: bool,
+) -> None:
+    """Ensure ADC credentials exist for Vertex backend, optionally prompting to login."""
+    ok, error = _check_vertex_adc()
+    if ok:
+        return
+
+    if no_prompt or not interactive_login:
+        raise RuntimeError(
+            "Vertex ADC credentials are not available. "
+            "Run `gcloud auth application-default login` and "
+            f"`gcloud auth application-default set-quota-project {project_id}` first. "
+            f"Detail: {error}"
+        )
+
+    print("Vertex ADC credentials not found or expired.")
+    proceed = input("Run `gcloud auth application-default login` now? [y/N]: ").strip().lower()
+    if proceed not in {"y", "yes"}:
+        raise RuntimeError("Vertex authentication cancelled by user.")
+
+    try:
+        subprocess.run(
+            ["gcloud", "auth", "application-default", "login"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "gcloud",
+                "auth",
+                "application-default",
+                "set-quota-project",
+                project_id,
+            ],
+            check=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "gcloud CLI not found in PATH. Install Google Cloud SDK to continue."
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"gcloud ADC setup failed: {exc}") from exc
+
+    ok, error = _check_vertex_adc()
+    if not ok:
+        raise RuntimeError(f"Vertex ADC is still unavailable after login: {error}")
+
+
+def _normalize_vertex_corpus_name(corpus: str, project_id: str, location: str) -> str:
+    """Normalize corpus ref to full Vertex RAG corpus resource name."""
+    raw = (corpus or "").strip()
+    if raw.startswith("projects/"):
+        return raw
+    if raw.startswith("ragCorpora/"):
+        return f"projects/{project_id}/locations/{location}/{raw}"
+    return f"projects/{project_id}/locations/{location}/ragCorpora/{raw}"
+
+
+def _call_vertex_list_corpora(project_id: str, location: str) -> Iterable:
+    """Call Vertex list corpora API with signature fallbacks."""
+    _ensure_vertex_runtime()
+    list_fn = getattr(rag, "list_corpora", None)
+    if list_fn is None:
+        raise RuntimeError("Vertex SDK missing rag.list_corpora().")
+
+    parent = f"projects/{project_id}/locations/{location}"
+    for kwargs in (
+        {},
+        {"parent": parent},
+        {"name": parent},
+        {"project": project_id, "location": location},
+    ):
+        try:
+            return list_fn(**kwargs)
+        except TypeError:
+            continue
+
+    for arg in (parent,):
+        try:
+            return list_fn(arg)
+        except TypeError:
+            continue
+
+    return list_fn()
+
+
+def _iter_vertex_corpora(project_id: str, location: str) -> Iterator[object]:
+    """Yield corpora from any supported list response shape."""
+    response = _call_vertex_list_corpora(project_id, location)
+    if response is None:
+        return iter(())
+    if hasattr(response, "__iter__"):
+        return iter(response)
+    if hasattr(response, "rag_corpora"):
+        return iter(response.rag_corpora)
+    if hasattr(response, "corpora"):
+        return iter(response.corpora)
+    return iter(())
+
+
+def _get_vertex_corpus_by_name(corpus_name: str) -> Optional[object]:
+    """Fetch a corpus by resource name; return None if missing or unsupported."""
+    _ensure_vertex_runtime()
+    get_fn = getattr(rag, "get_corpus", None)
+    if get_fn is None:
+        return None
+
+    for kwargs in (
+        {"name": corpus_name},
+        {"corpus_name": corpus_name},
+        {"rag_corpus_name": corpus_name},
+    ):
+        try:
+            return get_fn(**kwargs)
+        except TypeError:
+            continue
+        except Exception:
+            return None
+
+    try:
+        return get_fn(corpus_name)
+    except Exception:
+        return None
+
+
+def resolve_vertex_corpus_name(project_id: str, location: str, corpus_ref: str) -> str:
+    """Resolve corpus id/display-name/full-name to a full corpus resource name."""
+    raw = (corpus_ref or "").strip()
+    if not raw:
+        raise ValueError("Missing VERTEX_RAG_CORPUS.")
+
+    _init_vertex(project_id, location)
+
+    direct_name = _normalize_vertex_corpus_name(raw, project_id, location)
+    direct = _get_vertex_corpus_by_name(direct_name)
+    if direct is not None:
+        return direct_name
+
+    matches: List[str] = []
+    needle = raw.lower()
+    for corpus in _iter_vertex_corpora(project_id, location):
+        name = _get_attr(corpus, "name")
+        display = _get_attr(corpus, "display_name")
+        short_name = name.split("/")[-1] if name else ""
+        if needle in {display.lower(), short_name.lower()} and name:
+            matches.append(name)
+
+    unique_matches = sorted(set(matches))
+    if len(unique_matches) == 1:
+        return unique_matches[0]
+    if len(unique_matches) > 1:
+        raise ValueError(
+            "Multiple Vertex corpora matched VERTEX_RAG_CORPUS. "
+            "Set VERTEX_RAG_CORPUS to the full resource name."
+        )
+
+    raise ValueError(
+        "Unable to resolve VERTEX_RAG_CORPUS. "
+        "Use the full resource name: "
+        "projects/<project>/locations/<location>/ragCorpora/<id>."
+    )
+
+
+def build_sync_backend_config(*, no_prompt: bool) -> SyncBackendConfig:
+    """Build backend configuration and validate required auth/env settings."""
+    backend = resolve_sync_backend()
+    if backend == BACKEND_GEMINI:
+        store_name = _normalize_store(get_env("FILE_SEARCH_STORE"))
+        return SyncBackendConfig(backend=backend, store_name=store_name)
+
+    project_id = get_env("VERTEX_PROJECT_ID")
+    location = get_env("VERTEX_LOCATION")
+    corpus_ref = get_env("VERTEX_RAG_CORPUS")
+    interactive_login = _parse_bool_env("VERTEX_INTERACTIVE_LOGIN", True)
+    ensure_vertex_auth(
+        project_id,
+        no_prompt=no_prompt,
+        interactive_login=interactive_login,
+    )
+    corpus_name = resolve_vertex_corpus_name(project_id, location, corpus_ref)
+    return SyncBackendConfig(
+        backend=backend,
+        vertex_project_id=project_id,
+        vertex_location=location,
+        vertex_corpus_name=corpus_name,
+    )
 
 
 def _build_client() -> "genai.Client":
@@ -1175,11 +1467,268 @@ def _upload_with_retry(
     return None, "Upload failed without a document name."
 
 
-def _upload_worker(store_name: str, row: FileRow) -> Tuple[Optional[str], Optional[str]]:
-    """Upload a PDF with retry; return (document_name, error_message)."""
+def _call_vertex_list_files(corpus_name: str) -> Iterable:
+    """Call Vertex list files API with signature fallbacks."""
+    _ensure_vertex_runtime()
+    list_fn = getattr(rag, "list_files", None)
+    if list_fn is None:
+        raise RuntimeError("Vertex SDK missing rag.list_files().")
+
+    for kwargs in (
+        {"corpus_name": corpus_name},
+        {"rag_corpus_name": corpus_name},
+        {"parent": corpus_name},
+        {"name": corpus_name},
+    ):
+        try:
+            return list_fn(**kwargs)
+        except TypeError:
+            continue
+
+    return list_fn(corpus_name)
+
+
+def _iter_vertex_files(corpus_name: str) -> Iterator[object]:
+    """Yield files from any supported Vertex list files response shape."""
+    response = _call_vertex_list_files(corpus_name)
+    if response is None:
+        return iter(())
+    if hasattr(response, "__iter__"):
+        return iter(response)
+    if hasattr(response, "rag_files"):
+        return iter(response.rag_files)
+    if hasattr(response, "files"):
+        return iter(response.files)
+    return iter(())
+
+
+def find_vertex_file(
+    corpus_name: str,
+    display_name: str,
+    *,
+    case_sensitive: bool = False,
+) -> List[DocumentInfo]:
+    """Find Vertex files by exact display_name match."""
+    needle = (display_name or "").strip()
+    if not needle:
+        raise ValueError("Display name is required to search.")
+
+    if not case_sensitive:
+        needle = needle.lower()
+
+    matches: List[DocumentInfo] = []
+    for item in _iter_vertex_files(corpus_name):
+        display = _get_attr_any(item, ("display_name", "displayName"), "")
+        compare = display if case_sensitive else display.lower()
+        if compare != needle:
+            continue
+        matches.append(
+            DocumentInfo(
+                name=_get_attr(item, "name"),
+                display_name=display,
+                mime_type=_get_attr_any(item, ("mime_type", "mimeType"), "application/pdf"),
+                create_time=_get_attr_any(item, ("create_time", "createTime", "update_time"), ""),
+            )
+        )
+    return matches
+
+
+def _get_vertex_file_by_name(rag_file_name: str) -> Optional[object]:
+    """Fetch a Vertex RAG file by resource name."""
+    _ensure_vertex_runtime()
+    get_fn = getattr(rag, "get_file", None)
+    if get_fn is None:
+        return None
+
+    for kwargs in (
+        {"name": rag_file_name},
+        {"rag_file_name": rag_file_name},
+        {"file_name": rag_file_name},
+    ):
+        try:
+            return get_fn(**kwargs)
+        except TypeError:
+            continue
+        except Exception:
+            return None
+
     try:
-        client = _build_client()
-        return _upload_with_retry(client, store_name, row)
+        return get_fn(rag_file_name)
+    except Exception:
+        return None
+
+
+def _delete_vertex_file_by_name(rag_file_name: str) -> None:
+    """Delete a Vertex RAG file by resource name."""
+    _ensure_vertex_runtime()
+    delete_fn = getattr(rag, "delete_file", None)
+    if delete_fn is None:
+        raise RuntimeError("Vertex SDK missing rag.delete_file().")
+
+    for kwargs in (
+        {"name": rag_file_name},
+        {"rag_file_name": rag_file_name},
+        {"file_name": rag_file_name},
+    ):
+        try:
+            delete_fn(**kwargs)
+            return
+        except TypeError:
+            continue
+
+    delete_fn(rag_file_name)
+
+
+def _vertex_remote_file_exists(
+    corpus_name: str,
+    file_name: str,
+    remote_document_name: str,
+    *,
+    allow_fallback: bool,
+) -> bool:
+    """Check whether a Vertex remote file exists."""
+    if remote_document_name:
+        item = _get_vertex_file_by_name(remote_document_name)
+        if item is not None:
+            return True
+
+    if not allow_fallback:
+        return False
+
+    matches = find_vertex_file(corpus_name, file_name)
+    return bool(matches)
+
+
+def upload_pdf_to_vertex(corpus_name: str, file_path: Path) -> str:
+    """Upload a PDF file to Vertex RAG corpus."""
+    _ensure_vertex_runtime()
+    if not file_path.is_file():
+        raise FileNotFoundError(file_path)
+
+    upload_fn = getattr(rag, "upload_file", None)
+    if upload_fn is None:
+        raise RuntimeError("Vertex SDK missing rag.upload_file().")
+
+    upload_result = None
+    for kwargs in (
+        {"corpus_name": corpus_name, "path": str(file_path), "display_name": file_path.name},
+        {"rag_corpus_name": corpus_name, "path": str(file_path), "display_name": file_path.name},
+        {"parent": corpus_name, "path": str(file_path), "display_name": file_path.name},
+        {"corpus_name": corpus_name, "path": str(file_path)},
+        {"rag_corpus_name": corpus_name, "path": str(file_path)},
+    ):
+        try:
+            upload_result = upload_fn(**kwargs)
+            break
+        except TypeError:
+            continue
+
+    if upload_result is None:
+        upload_result = upload_fn(corpus_name, str(file_path))
+
+    for candidate in (
+        upload_result,
+        getattr(upload_result, "rag_file", None),
+        getattr(upload_result, "response", None),
+    ):
+        if candidate is None:
+            continue
+        rag_file_name = _get_attr_any(
+            candidate,
+            ("name", "rag_file_name", "ragFileName", "file_name"),
+            "",
+        )
+        if rag_file_name:
+            return rag_file_name
+
+    matches = find_vertex_file(corpus_name, file_path.name)
+    newest = _pick_newest_document(matches)
+    if not newest:
+        raise RuntimeError("Upload finished, but Vertex file name not found.")
+    return newest.name
+
+
+def _upload_vertex_with_retry(
+    corpus_name: str,
+    row: FileRow,
+    *,
+    max_attempts: int = 5,
+    base_delay: float = 1.0,
+    max_delay: float = 20.0,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Upload to Vertex backend with retry/backoff."""
+    for attempt in range(max_attempts):
+        try:
+            document_name = upload_pdf_to_vertex(corpus_name, row.local_path)
+            if not document_name:
+                return None, "Upload failed without a file name."
+            return document_name, None
+        except Exception as exc:
+            if attempt >= max_attempts - 1 or not _should_retry(exc):
+                return None, str(exc)
+            delay = min(max_delay, base_delay * (2 ** attempt))
+            delay += delay * 0.1 * random.random()
+            print(f"[RETRY] upload failed for {row.file_name}: {exc} (retry in {delay:.1f}s)")
+            time.sleep(delay)
+    return None, "Upload failed without a file name."
+
+
+def _backend_remote_exists(
+    backend_config: SyncBackendConfig,
+    *,
+    client: Optional["genai.Client"],
+    file_name: str,
+    remote_document_name: str,
+    allow_fallback: bool,
+) -> bool:
+    """Check remote file existence in the selected backend."""
+    if backend_config.backend == BACKEND_GEMINI:
+        if client is None:
+            raise RuntimeError("Gemini client is required for Gemini backend checks.")
+        return _remote_document_exists(
+            client,
+            backend_config.store_name,
+            file_name,
+            remote_document_name,
+            allow_fallback=allow_fallback,
+        )
+
+    _init_vertex(backend_config.vertex_project_id, backend_config.vertex_location)
+    return _vertex_remote_file_exists(
+        backend_config.vertex_corpus_name,
+        file_name,
+        remote_document_name,
+        allow_fallback=allow_fallback,
+    )
+
+
+def _upload_with_retry_backend(
+    backend_config: SyncBackendConfig,
+    row: FileRow,
+    *,
+    client: Optional["genai.Client"],
+) -> Tuple[Optional[str], Optional[str]]:
+    """Upload a file with retry for the selected backend."""
+    if backend_config.backend == BACKEND_GEMINI:
+        if client is None:
+            raise RuntimeError("Gemini client is required for Gemini uploads.")
+        return _upload_with_retry(client, backend_config.store_name, row)
+
+    _init_vertex(backend_config.vertex_project_id, backend_config.vertex_location)
+    return _upload_vertex_with_retry(backend_config.vertex_corpus_name, row)
+
+
+def _upload_worker(
+    backend_config: SyncBackendConfig,
+    row: FileRow,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Upload worker for concurrent uploads across sync backends."""
+    try:
+        if backend_config.backend == BACKEND_GEMINI:
+            client = _build_client()
+            return _upload_with_retry(client, backend_config.store_name, row)
+        _init_vertex(backend_config.vertex_project_id, backend_config.vertex_location)
+        return _upload_vertex_with_retry(backend_config.vertex_corpus_name, row)
     except Exception as exc:
         return None, str(exc)
 
@@ -1220,6 +1769,50 @@ def delete_remote_document(
         raise RuntimeError(f"No document selected for {file_name}")
     delete_document(client, target.name)
     return target.name
+
+
+def delete_vertex_remote_document(
+    corpus_name: str,
+    file_name: str,
+    remote_document_name: str,
+) -> str:
+    """Delete Vertex file by stored remote name or fallback to display_name search."""
+    if remote_document_name:
+        _delete_vertex_file_by_name(remote_document_name)
+        return remote_document_name
+
+    matches = find_vertex_file(corpus_name, file_name)
+    target = _choose_document(matches)
+    if target is None:
+        raise RuntimeError(f"No Vertex file selected for {file_name}")
+    _delete_vertex_file_by_name(target.name)
+    return target.name
+
+
+def _delete_remote_document_backend(
+    backend_config: SyncBackendConfig,
+    *,
+    client: Optional["genai.Client"],
+    file_name: str,
+    remote_document_name: str,
+) -> str:
+    """Delete a remote document in the selected backend."""
+    if backend_config.backend == BACKEND_GEMINI:
+        if client is None:
+            raise RuntimeError("Gemini client is required for Gemini deletes.")
+        return delete_remote_document(
+            client,
+            backend_config.store_name,
+            file_name,
+            remote_document_name,
+        )
+
+    _init_vertex(backend_config.vertex_project_id, backend_config.vertex_location)
+    return delete_vertex_remote_document(
+        backend_config.vertex_corpus_name,
+        file_name,
+        remote_document_name,
+    )
 
 
 def build_output_paths(output_dir: Path) -> Tuple[Path, Path, Path]:
@@ -1267,9 +1860,19 @@ def main() -> None:
     root_raw = get_env("ROOT_FOLDER")
     output_dir = Path(get_env("OUTPUT_DIR"))
     pdf_path, db_path, log_path = build_output_paths(output_dir)
+    no_prompt = _parse_bool_env("NO_PROMPT", False)
+    dry_run = _parse_bool_env("DRY_RUN", False)
+    backend_config = build_sync_backend_config(no_prompt=no_prompt)
+    backend_target = (
+        backend_config.store_name
+        if backend_config.backend == BACKEND_GEMINI
+        else backend_config.vertex_corpus_name
+    )
 
     configure_logging(log_path)
     logging.info("Run started.")
+    logging.info("Sync backend: %s", backend_config.backend)
+    logging.info("Sync backend target: %s", backend_target)
 
     timing_enabled = _parse_bool_env("PERF_TIMING", False)
     timings: Dict[str, float] = {}
@@ -1297,6 +1900,8 @@ def main() -> None:
     if not root_folder.exists() or not root_folder.is_dir():
         raise ValueError(f"ROOT_FOLDER is not a valid directory: {root_folder}")
 
+    print(f"Backend: {_backend_label(backend_config.backend)}")
+    print(f"Backend target: {backend_target}")
     print("Step 1: scan PDFs and generate index")
     logging.info("Scan start: %s", root_folder)
     _timing_start("scan_pdfs")
@@ -1323,15 +1928,16 @@ def main() -> None:
 
     print(f"Step 1 done: saved PDF to {pdf_path}")
 
-    dry_run = _parse_bool_env("DRY_RUN", False)
     if dry_run:
         print("Step 2 skipped: DRY_RUN=1")
         _finish_total()
         return
 
-    print("Step 2: sync local PDFs to Gemini File Search Store")
-    store_name = _normalize_store(get_env("FILE_SEARCH_STORE"))
-    client = _build_client()
+    print(f"Step 2: sync local PDFs to {_backend_label(backend_config.backend)}")
+
+    client: Optional["genai.Client"] = None
+    if backend_config.backend == BACKEND_GEMINI:
+        client = _build_client()
 
     _timing_start("compute_actions")
     state = load_state(db_path)
@@ -1349,7 +1955,6 @@ def main() -> None:
 
     confirm_removals = _parse_bool_env("CONFIRM_REMOVALS", True)
     allow_removals = _parse_bool_env("ALLOW_REMOVALS", False)
-    no_prompt = _parse_bool_env("NO_PROMPT", False)
     safe_replace = _parse_bool_env("SAFE_REPLACE", False)
     verify_remote = _parse_bool_env("VERIFY_REMOTE", False)
     max_concurrency_raw = _parse_int_env("UPLOAD_CONCURRENCY")
@@ -1367,11 +1972,11 @@ def main() -> None:
             if not record:
                 continue
             remote_name = record.get("remote_document_name") or ""
-            exists = _remote_document_exists(
-                client,
-                store_name,
-                row.file_name,
-                remote_name,
+            exists = _backend_remote_exists(
+                backend_config,
+                client=client,
+                file_name=row.file_name,
+                remote_document_name=remote_name,
                 allow_fallback=not bool(remote_name),
             )
             if not exists:
@@ -1391,11 +1996,11 @@ def main() -> None:
         if index_row and index_action is None:
             record = state.get(str(index_row.local_path))
             remote_name = record.get("remote_document_name") if record else ""
-            exists = _remote_document_exists(
-                client,
-                store_name,
-                index_row.file_name,
-                remote_name or "",
+            exists = _backend_remote_exists(
+                backend_config,
+                client=client,
+                file_name=index_row.file_name,
+                remote_document_name=remote_name or "",
                 allow_fallback=not bool(remote_name),
             )
             if not exists:
@@ -1474,13 +2079,22 @@ def main() -> None:
             try:
                 if action.action == "replace" and not safe_replace:
                     print(f"[REPLACE] {row.file_name} -> deleting old document")
-                    delete_remote_document(client, store_name, row.file_name, action.remote_document_name)
+                    _delete_remote_document_backend(
+                        backend_config,
+                        client=client,
+                        file_name=row.file_name,
+                        remote_document_name=action.remote_document_name,
+                    )
                 elif action.action == "replace" and safe_replace:
                     print(f"[REPLACE SAFE] {row.file_name} -> upload then delete old document")
                 elif action.action == "upload":
                     print(f"[UPLOAD] {row.file_name}")
 
-                document_name, error = _upload_with_retry(client, store_name, row)
+                document_name, error = _upload_with_retry_backend(
+                    backend_config,
+                    row,
+                    client=client,
+                )
                 if error:
                     raise RuntimeError(error)
 
@@ -1496,11 +2110,11 @@ def main() -> None:
                         print(f"[SKIP] {row.file_name}: missing remote_document_name for safe cleanup")
                     else:
                         try:
-                            delete_remote_document(
-                                client,
-                                store_name,
-                                row.file_name,
-                                action.remote_document_name,
+                            _delete_remote_document_backend(
+                                backend_config,
+                                client=client,
+                                file_name=row.file_name,
+                                remote_document_name=action.remote_document_name,
                             )
                         except Exception as exc:
                             logging.warning(
@@ -1524,7 +2138,12 @@ def main() -> None:
             try:
                 if action.action == "replace" and not safe_replace:
                     print(f"[REPLACE] {row.file_name} -> deleting old document")
-                    delete_remote_document(client, store_name, row.file_name, action.remote_document_name)
+                    _delete_remote_document_backend(
+                        backend_config,
+                        client=client,
+                        file_name=row.file_name,
+                        remote_document_name=action.remote_document_name,
+                    )
                 elif action.action == "replace" and safe_replace:
                     print(f"[REPLACE SAFE] {row.file_name} -> upload then delete old document")
                 elif action.action == "upload":
@@ -1538,7 +2157,7 @@ def main() -> None:
 
         with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
             future_map = {
-                executor.submit(_upload_worker, store_name, row): (action, row)
+                executor.submit(_upload_worker, backend_config, row): (action, row)
                 for action, row in pending
             }
             for future in as_completed(future_map):
@@ -1565,11 +2184,11 @@ def main() -> None:
                         print(f"[SKIP] {row.file_name}: missing remote_document_name for safe cleanup")
                     else:
                         try:
-                            delete_remote_document(
-                                client,
-                                store_name,
-                                row.file_name,
-                                action.remote_document_name,
+                            _delete_remote_document_backend(
+                                backend_config,
+                                client=client,
+                                file_name=row.file_name,
+                                remote_document_name=action.remote_document_name,
                             )
                         except Exception as exc:
                             logging.warning(
@@ -1626,7 +2245,12 @@ def main() -> None:
                 print(f"[SKIP] {file_name}: missing remote_document_name for removal")
                 continue
             print(f"[REMOVE] {file_name} -> deleting remote document")
-            delete_remote_document(client, store_name, file_name, remote_name)
+            _delete_remote_document_backend(
+                backend_config,
+                client=client,
+                file_name=file_name,
+                remote_document_name=remote_name,
+            )
             delete_state_entry(db_path, local_path)
             print(f"[REMOVE DONE] {file_name}")
         except Exception as exc:
@@ -1642,18 +2266,22 @@ def main() -> None:
         try:
             if index_action.action == "replace" and not safe_replace:
                 print(f"[INDEX REPLACE] {index_row.file_name} -> deleting old document")
-                delete_remote_document(
-                    client,
-                    store_name,
-                    index_row.file_name,
-                    index_action.remote_document_name,
+                _delete_remote_document_backend(
+                    backend_config,
+                    client=client,
+                    file_name=index_row.file_name,
+                    remote_document_name=index_action.remote_document_name,
                 )
             elif index_action.action == "replace" and safe_replace:
                 print(f"[INDEX REPLACE SAFE] {index_row.file_name} -> upload then delete old document")
             elif index_action.action == "upload":
                 print(f"[INDEX UPLOAD] {index_row.file_name}")
 
-            document_name, error = _upload_with_retry(client, store_name, index_row)
+            document_name, error = _upload_with_retry_backend(
+                backend_config,
+                index_row,
+                client=client,
+            )
             if error:
                 raise RuntimeError(error)
 
@@ -1668,11 +2296,11 @@ def main() -> None:
                     print("[INDEX SKIP] missing remote_document_name for safe cleanup")
                 else:
                     try:
-                        delete_remote_document(
-                            client,
-                            store_name,
-                            index_row.file_name,
-                            index_action.remote_document_name,
+                        _delete_remote_document_backend(
+                            backend_config,
+                            client=client,
+                            file_name=index_row.file_name,
+                            remote_document_name=index_action.remote_document_name,
                         )
                     except Exception as exc:
                         logging.warning("Index safe replace cleanup failed: %s", exc)

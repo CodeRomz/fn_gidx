@@ -1,17 +1,28 @@
-# Required
+# Required (all modes)
 ROOT_FOLDER=            # Root directory to scan.
-ROOT_DISPLAY_PATH=      # Optional display path for PDF (e.g., O:\QMS).
 OUTPUT_DIR=             # Output folder for index PDF, state DB, and logs.
+
+# Backend selector (required)
+SYNC_BACKEND=           # gemini_file_search | vertex_rag
+
+# Gemini backend required
 GEMINI_API_KEY=         # Google GenAI API key.
 FILE_SEARCH_STORE=      # Store name (short id or fileSearchStores/<id>).
 
+# Vertex backend required
+VERTEX_PROJECT_ID=      # GCP project id for Vertex.
+VERTEX_LOCATION=        # Vertex region, e.g. us-central1.
+VERTEX_RAG_CORPUS=      # Corpus ref: full name preferred.
+VERTEX_INTERACTIVE_LOGIN=1  # 1=allow interactive ADC login when missing and NO_PROMPT=0.
+
 # Optional scan controls
+ROOT_DISPLAY_PATH=      # Optional display path for PDF (e.g., O:\QMS).
 SKIP_FOLDER=            # Folders to skip (comma/semicolon list).
 MAX_FILE_SIZE_MB=       # Max size filter; blank means no limit.
 CHECK_PDF_MAGIC=1       # 1=check PDF header, 0=skip check.
-SCAN_CONCURRENCY=1     # Max parallel directory scans (default 1).
-SCAN_SPINNER=1         # 1=show scan spinner/status when concurrent.
-SCAN_THREAD_LINES=0    # 1=show per-thread scan lines (ANSI terminals).
+SCAN_CONCURRENCY=1      # Max parallel directory scans (default 1).
+SCAN_SPINNER=1          # 1=show scan spinner/status when concurrent.
+SCAN_THREAD_LINES=0     # 1=show per-thread scan lines (ANSI terminals).
 
 # Optional output paths
 OUTPUT_PDF=             # Override output PDF path (default OUTPUT_DIR\\gidx_index.pdf).
@@ -26,19 +37,20 @@ PDF_BUILD_SPINNER=1     # 1=show spinner during PDF build.
 DRY_RUN=0               # 1=skip sync, 0=run sync.
 
 # Prompt before remote deletions
-CONFIRM_REMOVALS=1      # 1=ask before deleting remote docs.
+CONFIRM_REMOVALS=1      # 1=ask before deleting remote docs/files.
 
 # Allow deletions and control prompts
 ALLOW_REMOVALS=0        # 1=enable remote deletes for removed local files.
 NO_PROMPT=0             # 1=auto-approve prompts (scheduler mode).
 REMOVAL_THRESHOLD=20    # Prompt if removal count meets/exceeds this value.
-SAFE_REPLACE=0          # 1=upload first, then delete old remote doc.
-VERIFY_REMOTE=0        # 1=verify remote docs exist; re-upload missing docs (slower).
-UPLOAD_CONCURRENCY=1    # Max parallel uploads (default 1). Do not exceed 45 request/concurrency.
+SAFE_REPLACE=0          # 1=upload first, then delete old remote doc/file.
+VERIFY_REMOTE=0         # 1=verify remote docs/files exist; re-upload missing items.
+UPLOAD_CONCURRENCY=1    # Max parallel uploads (default 1). Keep conservative.
 
 # Optional profiling
 PERF_TIMING=0           # 1=print/log timing per step.
 PROFILE_RUN=0           # 1=run cProfile and save OUTPUT_DIR\\gidx_profile.pstats.
 
 # Notes
+# For Vertex backend production use ADC/service-account auth (not API key only).
 # Deleting STATE_DB resets sync history and will re-upload everything.
